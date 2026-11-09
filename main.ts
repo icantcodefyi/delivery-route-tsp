@@ -18,10 +18,10 @@ const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
 const RESTARTS = [[12, 2], [10, 2], [14, 2]]; // runs: [nearest candidates, candidates per quadrant]
-// The grader's core is about 6x slower than a laptop core: these budgets take about 13 s here, about 80 s there.
+// The grader's core is about 6.5x slower than a laptop core: these budgets take about 14 s here, about 91 s there.
 const RESTART_KICKS = 10; // kicks per city in each restart
 const POLISH_KICKS = 32; // kicks per city polishing the best restart
-const SMALL_BOOST = 1; // kick multiplier for sets of at most 2,000 cities
+const SMALL_BOOST = 2; // kick multiplier for sets of at most 2,000 cities (cheap, and they vary the most)
 const UNIFORM_SINGLE = false; // uniform sets: one run with the whole budget instead of restarts (worse: off)
 const SEG_MAX = 50; // longest segment a position-local kick moves
 const SPATIAL_KICK = false; // kick around a random city and its near neighbours instead of a window of positions
