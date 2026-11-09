@@ -17,9 +17,17 @@ import { join } from 'node:path';
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-const K = 10; // candidate neighbours per city
-const KICKS_PER_CITY = 100; // iterated-local-search kicks per city (about 16 s for all eight sets on a laptop core)
-const SEG_MAX = 50; // longest segment a kick moves
+const RESTARTS = [[12, 2], [10, 2], [14, 2]]; // runs: [nearest candidates, candidates per quadrant]
+// The grader's core is about 5x slower than a laptop core: these budgets take about 13 s here, about 65 s there.
+const RESTART_KICKS = 10; // kicks per city in each restart
+const POLISH_KICKS = 30; // kicks per city polishing the best restart
+const SEG_MAX = 50; // longest segment a position-local kick moves
+const SPATIAL_KICK = false; // kick around a random city and its near neighbours instead of a window of positions
+const QUAD = 2; // candidates taken from each quadrant around a city
+const LONG_M = 100; // the long-edge pass looks at this many longest edges
+const LONG_ROUNDS = 40; // and applies at most this many moves per pass
+const LONG_PASSES = 4; // long-edge passes spread over the kicks
+const KICK_NB = 6; // the kick's two other cities come from this many nearest neighbours
 
 function readInstance(path) {
   const text = readFileSync(path, 'utf8');
@@ -36,7 +44,9 @@ function readInstance(path) {
   return { n, xs, ys };
 }
 
-function solve(n, X, Y) {
+// One full run: candidate lists with Kc nearest and Qc per quadrant, a start (greedy edge, or initTour), local
+// search, long-edge passes and kicksPerCity * n kicks seeded by seed.
+function solve(n, X, Y, Kc, Qc, kicksPerCity, seed, initTour) {
   const dist = (a, b) => {
     const dx = X[a] - X[b];
     const dy = Y[a] - Y[b];
@@ -44,7 +54,9 @@ function solve(n, X, Y) {
   };
 
   // ---- 1. K nearest neighbours with a grid ----
-  const KK = Math.min(K, n - 1);
+  const KK = Math.min(Kc, n - 1);
+  const KN = KK; // nearest cities gathered per city
+  const QN = Qc; // nearest cities gathered per quadrant
   const nb = new Int32Array(n * KK);
   const nbd = new Float64Array(n * KK);
   {
@@ -73,13 +85,18 @@ function solve(n, X, Y) {
     const fill = cellStart.slice(0, G * G);
     const items = new Int32Array(n);
     for (let i = 0; i < n; i++) items[fill[cellOf[i]]++] = i;
-    const bd = new Float64Array(KK + 1);
-    const bi = new Int32Array(KK + 1);
+    const bd = new Float64Array(KN + 1);
+    const bi = new Int32Array(KN + 1);
+    // per quadrant, the QN nearest cities, so that every direction (other clusters too) has a candidate
+    const qd = new Float64Array(4 * QN);
+    const qi = new Int32Array(4 * QN);
+    const qc = new Int32Array(4);
     const cmin = Math.min(cw, ch);
     for (let i = 0; i < n; i++) {
       const cx = cellOf[i] % G;
       const cy = (cellOf[i] - cx) / G;
       let cnt = 0;
+      qc[0] = qc[1] = qc[2] = qc[3] = 0;
       const xi = X[i], yi = Y[i];
       for (let r = 0; r <= G; r++) {
         const y0 = cy - r, y1 = cy + r, x0 = cx - r, x1 = cx + r;
@@ -94,8 +111,8 @@ function solve(n, X, Y) {
                 if (j === i) continue;
                 const dx = X[j] - xi, dy = Y[j] - yi;
                 const d2 = dx * dx + dy * dy;
-                if (cnt < KK || d2 < bd[cnt - 1]) {
-                  let p = cnt < KK ? cnt++ : cnt - 1;
+                if (cnt < KN || d2 < bd[cnt - 1]) {
+                  let p = cnt < KN ? cnt++ : cnt - 1;
                   while (p > 0 && bd[p - 1] > d2) {
                     bd[p] = bd[p - 1];
                     bi[p] = bi[p - 1];
@@ -104,17 +121,50 @@ function solve(n, X, Y) {
                   bd[p] = d2;
                   bi[p] = j;
                 }
+                const q = (dx >= 0 ? 0 : 1) + (dy >= 0 ? 0 : 2);
+                const qb = q * QN;
+                const m = qc[q];
+                if (m < QN || d2 < qd[qb + m - 1]) {
+                  let p = m < QN ? qc[q]++ : m - 1;
+                  while (p > 0 && qd[qb + p - 1] > d2) {
+                    qd[qb + p] = qd[qb + p - 1];
+                    qi[qb + p] = qi[qb + p - 1];
+                    p--;
+                  }
+                  qd[qb + p] = d2;
+                  qi[qb + p] = j;
+                }
               }
             }
             if (x1 === x0) break;
           }
         }
         const reach = r * cmin;
-        if (cnt >= KK && bd[cnt - 1] <= reach * reach) break;
+        const r2 = reach * reach;
+        if (cnt >= KN && bd[cnt - 1] <= r2) {
+          let done = true;
+          for (let q = 0; q < 4 && done; q++) if (qc[q] < QN || qd[q * QN + QN - 1] > r2) done = false;
+          if (done) break;
+        }
       }
+      // the candidate list: the quadrant picks, then the nearest cities, KK distinct, sorted by distance
+      let m = 0;
+      const cand = [];
+      for (let q = 0; q < 4; q++) for (let t = 0; t < qc[q]; t++) cand.push(qi[q * QN + t]);
+      for (let t = 0; t < cnt; t++) cand.push(bi[t]);
+      const pick = [];
+      for (const c of cand) {
+        if (m >= KK) break;
+        if (pick.indexOf(c) >= 0) continue;
+        pick.push(c);
+        m++;
+      }
+      const pd = pick.map((c) => (X[c] - xi) * (X[c] - xi) + (Y[c] - yi) * (Y[c] - yi));
+      const ord = pick.map((_, t) => t).sort((a, b) => pd[a] - pd[b] || pick[a] - pick[b]);
       for (let k = 0; k < KK; k++) {
-        nb[i * KK + k] = bi[k];
-        nbd[i * KK + k] = dist(i, bi[k]);
+        const c = pick[ord[k]];
+        nb[i * KK + k] = c;
+        nbd[i * KK + k] = dist(i, c);
       }
     }
   }
@@ -122,7 +172,10 @@ function solve(n, X, Y) {
   // ---- 2. greedy-edge start ----
   const tour = new Int32Array(n);
   const pos = new Int32Array(n);
-  {
+  if (initTour) {
+    tour.set(initTour);
+    for (let i = 0; i < n; i++) pos[tour[i]] = i;
+  } else {
     const eu = [], ev = [], ew = [];
     for (let i = 0; i < n; i++) {
       for (let k = 0; k < KK; k++) {
@@ -269,7 +322,7 @@ function solve(n, X, Y) {
   };
 
   // move the segment at positions i..i+L-1 into the gap after position k, reversed if rev
-  const segTmp = new Int32Array(SEG_MAX + 8);
+  const segTmp = new Int32Array(n + 8);
   const moveSegment = (i, L, k, rev) => {
     const j = (i + L - 1) % n;
     let df = k - j;
@@ -456,8 +509,144 @@ function solve(n, X, Y) {
   for (let k = 0; k < n; k++) push(tour[k]);
   localSearch();
 
+  // Long-edge pass: the longest tour edges are mostly the links between clusters. Try every 3-opt reconnection
+  // of every triple of them (A B C -> A C B, A C B', A C' B, A B' C'), apply the best, repair locally, repeat.
+  const el = new Float64Array(n);
+  const keys = new Float64Array(n);
+  const longEdgePass = () => {
+    const M = Math.min(LONG_M, n - 1);
+    const P = new Int32Array(M);
+    for (let round = 0; round < LONG_ROUNDS; round++) {
+      for (let p = 0; p < n; p++) {
+        el[p] = dist(tour[p], tour[p + 1 === n ? 0 : p + 1]);
+        keys[p] = -(el[p] * 16384 + p);
+      }
+      const sorted = keys.slice().sort();
+      for (let t = 0; t < M; t++) P[t] = (-sorted[t]) % 16384;
+      P.sort();
+      let best = 0, bi = -1, bj = -1, bk = -1, btype = 0;
+      for (let x = 0; x < M; x++) {
+        const p1 = P[x];
+        const a = tour[p1], b1 = tour[p1 + 1 === n ? 0 : p1 + 1];
+        for (let y = x + 1; y < M; y++) {
+          const p2 = P[y];
+          const b2 = tour[p2], c1 = tour[p2 + 1 === n ? 0 : p2 + 1];
+          const r12 = el[p1] + el[p2];
+          const dac1 = dist(a, c1);
+          const dab2 = dist(a, b2);
+          // 2-opt between the two long edges: A B' C
+          const g2 = dab2 + dist(b1, c1) - r12;
+          if (g2 < best) { best = g2; bi = p1; bj = p2; bk = -1; btype = 6; }
+          for (let z = y + 1; z < M; z++) {
+            const p3 = P[z];
+            const c2 = tour[p3], d = tour[p3 + 1 === n ? 0 : p3 + 1];
+            const removed = r12 + el[p3];
+            // A C B
+            let g = dac1 + dist(c2, b1) + dist(b2, d) - removed;
+            if (g < best) { best = g; bi = p1; bj = p2; bk = p3; btype = 1; }
+            // A C B'
+            g = dac1 + dist(c2, b2) + dist(b1, d) - removed;
+            if (g < best) { best = g; bi = p1; bj = p2; bk = p3; btype = 2; }
+            // A C' B
+            g = dist(a, c2) + dist(c1, b1) + dist(b2, d) - removed;
+            if (g < best) { best = g; bi = p1; bj = p2; bk = p3; btype = 3; }
+            // A B' C'
+            g = dab2 + dist(b1, c2) + dist(c1, d) - removed;
+            if (g < best) { best = g; bi = p1; bj = p2; bk = p3; btype = 4; }
+          }
+        }
+      }
+      // Or-opt of a whole stretch between two long edges (often one visit of a cluster), into the gap next to a
+      // candidate neighbour of one of its ends: this merges two visits of one cluster into one
+      let mi = -1, ml = 0, mk = 0, mrev = false;
+      let u0 = 0, u1 = 0, u2 = 0, u3 = 0, u4 = 0, u5 = 0;
+      for (let x = 0; x < M; x++) {
+        for (let y = x + 1; y < M; y++) {
+          const p1 = P[x], p2 = P[y];
+          for (let side = 0; side < 2; side++) {
+            const i = side === 0 ? (p1 + 1) % n : (p2 + 1) % n;
+            const len = side === 0 ? p2 - p1 : n - (p2 - p1);
+            const j = side === 0 ? p2 : p1;
+            if (len < 2 || len > n - 3) continue;
+            const s1 = tour[i], s2 = tour[j];
+            const o1 = tour[i === 0 ? n - 1 : i - 1], o2 = tour[j + 1 === n ? 0 : j + 1];
+            const G = el[p1] + el[p2] - dist(o1, o2);
+            if (G <= 0) continue;
+            for (let end = 0; end < 2; end++) {
+              const s = end === 0 ? s1 : s2;
+              const o = end === 0 ? s2 : s1;
+              const sb = s * KK;
+              for (let k = 0; k < KK; k++) {
+                const dc = nbd[sb + k];
+                if (dc >= G) break;
+                const c = nb[sb + k];
+                let r = pos[c] - i;
+                if (r < 0) r += n;
+                if (r < len) continue;
+                const e = succ(c);
+                let re = pos[e] - i;
+                if (re < 0) re += n;
+                if (re >= len) {
+                  const g = dc + dist(o, e) - dist(c, e) - G;
+                  if (g < best) {
+                    best = g; btype = 5; mi = i; ml = len; mk = pos[c]; mrev = end === 1;
+                    u0 = s1; u1 = s2; u2 = o1; u3 = o2; u4 = c; u5 = e;
+                  }
+                }
+                const f = pred(c);
+                let rf = pos[f] - i;
+                if (rf < 0) rf += n;
+                if (rf >= len) {
+                  const g = dc + dist(o, f) - dist(f, c) - G;
+                  if (g < best) {
+                    best = g; btype = 5; mi = i; ml = len; mk = pos[f]; mrev = end === 0;
+                    u0 = s1; u1 = s2; u2 = o1; u3 = o2; u4 = c; u5 = f;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      if (btype === 0) return;
+      if (btype === 6) {
+        const a = tour[bi], b1 = tour[(bi + 1) % n], b2 = tour[bj], c1 = tour[(bj + 1) % n];
+        reversePath((bi + 1) % n, bj);
+        push(a); push(b1); push(b2); push(c1);
+        localSearch();
+        continue;
+      }
+      if (btype === 5) {
+        moveSegment(mi, ml, mk, mrev);
+        push(u0); push(u1); push(u2); push(u3); push(u4); push(u5);
+        localSearch();
+        continue;
+      }
+      const p1 = bi, p2 = bj, p3 = bk;
+      const a = tour[p1], b1 = tour[(p1 + 1) % n], b2 = tour[p2], c1 = tour[(p2 + 1) % n], c2 = tour[p3], d = tour[(p3 + 1) % n];
+      const lb = p2 - p1, lc = p3 - p2;
+      if (btype === 1) {
+        if (lb <= lc) moveSegment((p1 + 1) % n, lb, p3, false);
+        else moveSegment((p2 + 1) % n, lc, p1, false);
+      } else if (btype === 2) {
+        moveSegment((p1 + 1) % n, lb, p3, true);
+      } else if (btype === 3) {
+        moveSegment((p2 + 1) % n, lc, p1, true);
+      } else {
+        reversePath((p1 + 1) % n, p2);
+        let r = pos[c2] - pos[c1];
+        if (r < 0) r += n;
+        if (r === lc - 1) reversePath(pos[c1], pos[c2]);
+        else reversePath(pos[c2], pos[c1]);
+      }
+      push(a); push(b1); push(b2); push(c1); push(c2); push(d);
+      localSearch();
+    }
+  };
+  longEdgePass();
+
   // ---- 4. iterated local search ----
-  let rs = (0x9e3779b9 ^ (n * 2654435761)) | 0;
+  let rs = (0x9e3779b9 ^ (n * 2654435761) ^ Math.imul(seed + 1, 0x85ebca6b)) | 0;
   if (rs === 0) rs = 1;
   const rnd = () => {
     rs ^= rs << 13;
@@ -466,16 +655,64 @@ function solve(n, X, Y) {
     return rs >>> 0;
   };
   const segMax = Math.max(1, Math.min(SEG_MAX, Math.floor(n / 8)));
-  const kicks = KICKS_PER_CITY * n;
+  const dbTmp = new Int32Array(3 * segMax + 8);
+  const kicks = Math.floor(kicksPerCity * n);
   let cur = tourLength();
+  const longEvery = Math.max(1, Math.floor(kicks / LONG_PASSES));
   for (let it = 0; it < kicks; it++) {
-    const p0 = rnd() % n;
-    const l1 = 1 + (rnd() % segMax);
-    const l2 = 1 + (rnd() % segMax);
-    const i = p0 + 1 === n ? 0 : p0 + 1;
-    const pb = (p0 + l1) % n;
+    if (it > 0 && it % longEvery === 0) longEdgePass();
+    // three cut positions p0 < pb < k: swap the segments B = p0+1..pb and C = pb+1..k (a double bridge)
+    let p0, pb, k;
+    if (SPATIAL_KICK) {
+      // cut right after a random city and two of its near neighbours, so the three new edges are short
+      const v = rnd() % n;
+      const w1 = nb[v * KK + (rnd() % KICK_NB)];
+      const w2 = nb[v * KK + (rnd() % KICK_NB)];
+      const q0 = pos[v], q1 = pos[w1], q2 = pos[w2];
+      if (q0 === q1 || q0 === q2 || q1 === q2) continue;
+      p0 = Math.min(q0, q1, q2);
+      k = Math.max(q0, q1, q2);
+      pb = q0 + q1 + q2 - p0 - k;
+      if (p0 === 0 && k === n - 1) continue;
+    } else {
+      // a true double bridge on three short consecutive segments: A B C D -> A D C B (four edges change, and no
+      // sequential 2-opt/3-opt move undoes it)
+      p0 = rnd() % n;
+      const l1 = 1 + (rnd() % segMax);
+      const l2 = 1 + (rnd() % segMax);
+      const l3 = 1 + (rnd() % segMax);
+      const pB = (p0 + l1) % n, pC = (p0 + l1 + l2) % n, pD = (p0 + l1 + l2 + l3) % n;
+      const a = tour[p0], b1 = tour[(p0 + 1) % n], b2 = tour[pB], c1 = tour[(pB + 1) % n];
+      const c2 = tour[pC], d1 = tour[(pC + 1) % n], d2 = tour[pD], e = tour[(pD + 1) % n];
+      const dlt = dist(a, d1) + dist(d2, c1) + dist(c2, b1) + dist(b2, e)
+        - dist(a, b1) - dist(b2, c1) - dist(c2, d1) - dist(d2, e);
+      logging = true;
+      overflow = false;
+      nOps = 0;
+      bufTop = 0;
+      const start = (p0 + 1) % n;
+      const W = l1 + l2 + l3;
+      saveRange(start, W);
+      let q = start;
+      for (let t = 0; t < W; t++) {
+        dbTmp[t] = tour[q];
+        if (++q === n) q = 0;
+      }
+      let p = start;
+      for (let t = l1 + l2; t < W; t++) { const c = dbTmp[t]; tour[p] = c; pos[c] = p; if (++p === n) p = 0; }
+      for (let t = l1; t < l1 + l2; t++) { const c = dbTmp[t]; tour[p] = c; pos[c] = p; if (++p === n) p = 0; }
+      for (let t = 0; t < l1; t++) { const c = dbTmp[t]; tour[p] = c; pos[c] = p; if (++p === n) p = 0; }
+      push(a); push(b1); push(b2); push(c1); push(c2); push(d1); push(d2); push(e);
+      const total = dlt + localSearch();
+      if (total <= 0 || overflow) cur += total;
+      else undoAll();
+      logging = false;
+      continue;
+    }
+    const i = (p0 + 1) % n;
+    pb %= n;
+    k %= n;
     const pc = (pb + 1) % n;
-    const k = (p0 + l1 + l2) % n;
     const kn = k + 1 === n ? 0 : k + 1;
     const aE = tour[p0], bS = tour[i], bE = tour[pb], cS = tour[pc], cE = tour[k], dS = tour[kn];
     let delta = dist(aE, cS) + dist(cE, bS) + dist(bE, dS) - dist(aE, bS) - dist(bE, cS) - dist(cE, dS);
@@ -483,7 +720,13 @@ function solve(n, X, Y) {
     overflow = false;
     nOps = 0;
     bufTop = 0;
-    moveSegment(i, l1, k, false);
+    let lb = pb - p0;
+    if (lb < 0) lb += n;
+    let lc = k - pb;
+    if (lc < 0) lc += n;
+    // move the shorter of the two segments
+    if (lb <= lc) moveSegment(i, lb, k, false);
+    else moveSegment(pc, lc, p0, false);
     push(aE); push(bS); push(bE); push(cS); push(cE); push(dS);
     delta += localSearch();
     if (delta <= 0 || overflow) cur += delta;
@@ -491,6 +734,7 @@ function solve(n, X, Y) {
     logging = false;
   }
 
+  longEdgePass();
   return { tour, length: cur, check: tourLength() };
 }
 
@@ -511,7 +755,19 @@ for (const name of readdirSync(INPUT_DIR).filter((f) => f.endsWith('.txt')).sort
   if (n <= 8) {
     tour = Int32Array.from({ length: n }, (_, k) => k);
   } else {
-    tour = solve(n, xs, ys).tour;
+    // restarts with different candidate lists (clustered sets are chaotic: the cluster order a run settles on
+    // varies), keep the shortest, then polish it with more kicks
+    let best = null;
+    let bestCfg = 0;
+    for (let r = 0; r < RESTARTS.length; r++) {
+      const res = solve(n, xs, ys, RESTARTS[r][0], RESTARTS[r][1], RESTART_KICKS, r, null);
+      if (best === null || res.check < best.check) {
+        best = res;
+        bestCfg = r;
+      }
+    }
+    const fin = solve(n, xs, ys, RESTARTS[bestCfg][0], RESTARTS[bestCfg][1], POLISH_KICKS, 99, best.tour);
+    tour = fin.check <= best.check ? fin.tour : best.tour;
   }
   if (!validTour(tour, n)) tour = Int32Array.from({ length: n }, (_, k) => k);
   writeFileSync(join(OUTPUT_DIR, name.replace(/\.txt$/, '.tour')), `${Array.from(tour).join('\n')}\n`);
