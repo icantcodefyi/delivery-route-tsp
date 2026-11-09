@@ -18,9 +18,11 @@ const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
 const RESTARTS = [[12, 2], [10, 2], [14, 2]]; // runs: [nearest candidates, candidates per quadrant]
-// The grader's core is about 5x slower than a laptop core: these budgets take about 13 s here, about 65 s there.
+// The grader's core is about 6x slower than a laptop core: these budgets take about 13 s here, about 80 s there.
 const RESTART_KICKS = 10; // kicks per city in each restart
-const POLISH_KICKS = 30; // kicks per city polishing the best restart
+const POLISH_KICKS = 32; // kicks per city polishing the best restart
+const SMALL_BOOST = 1; // kick multiplier for sets of at most 2,000 cities
+const UNIFORM_SINGLE = false; // uniform sets: one run with the whole budget instead of restarts (worse: off)
 const SEG_MAX = 50; // longest segment a position-local kick moves
 const SPATIAL_KICK = false; // kick around a random city and its near neighbours instead of a window of positions
 const QUAD = 2; // candidates taken from each quadrant around a city
@@ -279,10 +281,38 @@ function solve(n, X, Y, Kc, Qc, kicksPerCity, seed, initTour) {
       if (++p === n) p = 0;
     }
   };
+  // a reversal is its own inverse: log only its range (as a negative length), undo it by reversing again
+  const logReversal = (start, len) => {
+    if (!logging || overflow) return;
+    if (nOps >= OPS_CAP) {
+      overflow = true;
+      return;
+    }
+    logStart[nOps] = start;
+    logLen[nOps] = -len;
+    nOps++;
+  };
+  const rawReverse = (i, len) => {
+    let a = i, b = i + len - 1;
+    if (b >= n) b -= n;
+    for (let t = len >> 1; t > 0; t--) {
+      const ca = tour[a], cb = tour[b];
+      tour[a] = cb;
+      pos[cb] = a;
+      tour[b] = ca;
+      pos[ca] = b;
+      if (++a === n) a = 0;
+      if (--b < 0) b = n - 1;
+    }
+  };
   const undoAll = () => {
     for (let o = nOps - 1; o >= 0; o--) {
       const len = logLen[o];
       let p = logStart[o];
+      if (len < 0) {
+        rawReverse(p, -len);
+        continue;
+      }
       bufTop -= len;
       let b = bufTop;
       for (let t = 0; t < len; t++) {
@@ -308,17 +338,8 @@ function solve(n, X, Y, Kc, Qc, kicksPerCity, seed, initTour) {
       j = nj;
       len = n - len;
     }
-    saveRange(i, len);
-    let a = i, b = j;
-    for (let t = len >> 1; t > 0; t--) {
-      const ca = tour[a], cb = tour[b];
-      tour[a] = cb;
-      pos[cb] = a;
-      tour[b] = ca;
-      pos[ca] = b;
-      if (++a === n) a = 0;
-      if (--b < 0) b = n - 1;
-    }
+    logReversal(i, len);
+    rawReverse(i, len);
   };
 
   // move the segment at positions i..i+L-1 into the gap after position k, reversed if rev
@@ -514,7 +535,8 @@ function solve(n, X, Y, Kc, Qc, kicksPerCity, seed, initTour) {
   const el = new Float64Array(n);
   const keys = new Float64Array(n);
   const longEdgePass = () => {
-    const M = Math.min(LONG_M, n - 1);
+    // big clustered sets have more links between clusters: look at 1.5% of the edges, at least LONG_M
+    const M = Math.min(Math.max(LONG_M, Math.round(n * 0.015)), n - 1);
     const P = new Int32Array(M);
     for (let round = 0; round < LONG_ROUNDS; round++) {
       for (let p = 0; p < n; p++) {
@@ -738,6 +760,23 @@ function solve(n, X, Y, Kc, Qc, kicksPerCity, seed, initTour) {
   return { tour, length: cur, check: tourLength() };
 }
 
+// Clustered or uniform, from the data: with about two cities per grid cell, a uniform set leaves about e^-2 = 14%
+// of the cells empty, a clustered one most of them.
+function isClustered(n, X, Y) {
+  const G = Math.max(1, Math.floor(Math.sqrt(n / 2)));
+  const seen = new Uint8Array(G * G);
+  for (let i = 0; i < n; i++) {
+    let cx = Math.floor((X[i] * G) / 1000001);
+    let cy = Math.floor((Y[i] * G) / 1000001);
+    if (cx >= G) cx = G - 1;
+    if (cy >= G) cy = G - 1;
+    seen[cy * G + cx] = 1;
+  }
+  let empty = 0;
+  for (let c = 0; c < G * G; c++) if (!seen[c]) empty++;
+  return empty > 0.4 * G * G;
+}
+
 function validTour(t, n) {
   if (t.length !== n) return false;
   const seen = new Uint8Array(n);
@@ -754,20 +793,27 @@ for (const name of readdirSync(INPUT_DIR).filter((f) => f.endsWith('.txt')).sort
   let tour;
   if (n <= 8) {
     tour = Int32Array.from({ length: n }, (_, k) => k);
-  } else {
+  } else if (!UNIFORM_SINGLE || isClustered(n, xs, ys)) {
     // restarts with different candidate lists (clustered sets are chaotic: the cluster order a run settles on
     // varies), keep the shortest, then polish it with more kicks
     let best = null;
     let bestCfg = 0;
-    for (let r = 0; r < RESTARTS.length; r++) {
-      const res = solve(n, xs, ys, RESTARTS[r][0], RESTARTS[r][1], RESTART_KICKS, r, null);
+    // small sets are cheap: give them more kicks per city
+    const boost = n <= 2000 ? SMALL_BOOST : 1;
+    const runs = RESTARTS;
+    for (let r = 0; r < runs.length; r++) {
+      const res = solve(n, xs, ys, runs[r][0], runs[r][1], RESTART_KICKS * boost, r, null);
       if (best === null || res.check < best.check) {
         best = res;
         bestCfg = r;
       }
     }
-    const fin = solve(n, xs, ys, RESTARTS[bestCfg][0], RESTARTS[bestCfg][1], POLISH_KICKS, 99, best.tour);
+    const fin = solve(n, xs, ys, runs[bestCfg][0], runs[bestCfg][1], POLISH_KICKS * boost, 99, best.tour);
     tour = fin.check <= best.check ? fin.tour : best.tour;
+  } else {
+    // a uniform set has no cluster order to get wrong: one run gets the whole kick budget
+    const total = RESTARTS.length * RESTART_KICKS + POLISH_KICKS;
+    tour = solve(n, xs, ys, RESTARTS[0][0], RESTARTS[0][1], total, 0, null).tour;
   }
   if (!validTour(tour, n)) tour = Int32Array.from({ length: n }, (_, k) => k);
   writeFileSync(join(OUTPUT_DIR, name.replace(/\.txt$/, '.tour')), `${Array.from(tour).join('\n')}\n`);
